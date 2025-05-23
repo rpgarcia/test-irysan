@@ -1,0 +1,5 @@
+vpc_cidr: "10.100.0.0/16"
+environment: "rodri"
+organization: rodri
+account: "rodri"
+region: us-east-1

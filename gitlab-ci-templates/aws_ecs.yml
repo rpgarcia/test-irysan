@@ -1,0 +1,73 @@
+.update_task_definition:
+  script: |-
+    aws --no-cli-auto-prompt sts get-caller-identity
+
+    if aws --version >/dev/null 2>&1 ; then
+      if ! aws --no-cli-auto-prompt sts get-caller-identity >/dev/null; then
+        printf "%s: No AWS credentials available\n" "$( basename "$0" )" 1>&2
+        exit 1
+      fi
+    else
+      printf "%s: AWS CLI tool not found\n" "$( basename "$0" )" 1>&2
+      exit 1
+    fi
+
+    if ! jq --version >/dev/null 2>&1; then
+      printf "%s: jq CLI tool not found\n" "$( basename "$0" )" 1>&2
+      exit 1
+    fi
+
+    echo "Fetching the task definition"
+
+    cluster_name=$ECS_AND_TASK
+    service_name=$ECS_AND_TASK
+    current_task="$(aws ecs describe-task-definition --task-definition $ECS_AND_TASK)"
+    current_container_definitions=$(echo "$current_task" | jq '.taskDefinition.containerDefinitions')
+
+    echo "current_container_definitions: $current_container_definitions"
+
+    current_image_url="$( printf "%s" "$current_container_definitions" | jq -r '.[0] | .image' )"
+
+    if [ -n "$CI_COMMIT_TAG" ]; then
+      IMAGE_TAG="$CI_COMMIT_TAG-$ENV"
+    else
+      IMAGE_TAG="$CI_COMMIT_SHORT_SHA-$ENV"
+    fi
+
+    new_image_url="$( printf "%s:%s" "$( printf "%s" "${current_image_url}" | cut -d : -f 1 )" "$IMAGE_TAG" )"
+
+    echo "#### Task Image"
+    echo $current_image_url
+    echo $new_image_url
+
+    # make temporary file
+    task_definition_params_path=$(mktemp 2>/dev/null || tempfile) || exit 1
+    trap "rm -f -- '${task_definition_params_path}' '${TMP_CONFIG_FILE}'" EXIT
+
+    printf "%s" "$current_task" \
+      | jq ' .taskDefinition' \
+      | jq ' .containerDefinitions = (.containerDefinitions |  map(if .image == "'"${current_image_url}"'" then .image= "'"${new_image_url}"'"  else . end) )' \
+      | jq ' del(.status, .compatibilities, .taskDefinitionArn, .requiresAttributes, .revision, .registeredBy, .registeredAt) ' \
+    > "${task_definition_params_path}"
+
+    # Create new revision of the task definition, with updated image revision.
+    new_task_definition_details="$( \
+      aws ecs register-task-definition --cli-input-json "file://${task_definition_params_path}" --output json )"
+
+    new_task_definition_arn="$(echo "$new_task_definition_details" | jq -r '.taskDefinition.taskDefinitionArn')"
+    new_task_definition_revision="$(echo "$new_task_definition_details" | jq -r '.taskDefinition.revision')"
+    new_task_definition_family="$(echo "$new_task_definition_details" | jq -r '.taskDefinition.family')"
+
+    # Update ECS service with newly created task defintion revision.
+    output="$( aws ecs update-service --cluster "$cluster_name" --service "$service_name" --task-definition "${new_task_definition_family}:${new_task_definition_revision}" --output json )"
+    [ "$?" = 0 ] || exit 1
+
+    # debug
+    printf "Service deployments\n" 1>&2
+    printf "%s\n" "${output}" | jq .service.deployments 1>&2
+    printf "\n" 1>&2
+
+    printf "Updated service %s to task %s\n" "${service_name}" "${new_task_definition_arn}" 1>&2
+
+    echo "Waiting for deployment rollout to complete" 1>&2
+    exec aws ecs wait services-stable --cluster "$cluster_name" --services "$service_name"

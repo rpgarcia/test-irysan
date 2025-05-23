@@ -1,0 +1,54 @@
+image: docker.io/library/docker:24.0.7
+services:
+- name: docker.io/library/docker:24.0.7-dind
+  alias: docker
+
+stages:
+- build
+- test
+- deploy
+
+include:
+- local: 'gitlab-ci-templates/aws_ecs.yml'
+- local: 'gitlab-ci-templates/docker_login_build.yml'
+
+variables:
+  DOCKERFILE: ./Dockerfile
+
+# DEV
+ecr-image:
+  stage: build
+  script:
+  - !reference [ .docker_login, script ]
+  - !reference [ .docker_build_and_push, script ]
+  variables:
+    ENV: "dev"
+  # only:
+  # - dev
+  allow_failure: false
+
+test:
+  stage: test
+  image: python:3.9
+  before_script:
+  - pip install -r requirements.txt
+  script:
+  - pytest --maxfail=1 --disable-warnings -q
+  # only:
+  # - dev
+  tags:
+  - python
+
+deploy:
+  stage: deploy
+  needs:
+  - ecr-image
+  variables:
+    ENV: "dev"
+    TARGET_ROLE_ARN: $TARGET_ROLE_ARN_DEVELOP
+    ECS_AND_TASK: irysan
+  script:
+  - !reference [ .update_task_definition, script ]
+  # only:
+  # - dev
+  allow_failure: false
